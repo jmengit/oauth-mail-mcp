@@ -1,0 +1,64 @@
+# Reference deployment. The live copy lives in Arcane, with the values supplied there.
+#
+#   GMAIL_ADDRESS / M365_ADDRESS        the mailbox address
+#   GMAIL_MCP_TOKEN / M365_MCP_TOKEN    32-byte bearer token used by the MCP client
+#   GOOGLE_CLIENT_SECRET                Mozilla's public Thunderbird client secret
+#
+# One container per account. Nothing account-specific belongs in this file.
+
+services:
+  gmail:
+    image: ghcr.io/jmengit/oauth-mail-mcp:latest
+    container_name: oauth-mail-mcp-gmail
+    restart: unless-stopped
+    environment:
+      MAIL_ACCOUNT: gmail
+      MAIL_ADDRESS: ${GMAIL_ADDRESS}
+      MAIL_MCP_TOKEN: ${GMAIL_MCP_TOKEN}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      MAIL_ALLOW_SEND: "false"
+      MAIL_HEALTH_CACHE_SECS: "60"
+    volumes:
+      - gmail-data:/data
+    ports:
+      - "18080:8081"            # /health, LAN — for Uptime Kuma
+      - "127.0.0.1:18081:8082"  # OAuth callback, loopback on the Mac only
+    networks:
+      - mail
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/health"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+  m365:
+    image: ghcr.io/jmengit/oauth-mail-mcp:latest
+    container_name: oauth-mail-mcp-m365
+    restart: unless-stopped
+    environment:
+      MAIL_ACCOUNT: m365
+      MAIL_ADDRESS: ${M365_ADDRESS}
+      MAIL_MCP_TOKEN: ${M365_MCP_TOKEN}
+      MAIL_ALLOW_SEND: "false"
+      MAIL_HEALTH_CACHE_SECS: "60"
+    volumes:
+      - m365-data:/data
+    ports:
+      - "18090:8081"            # /health, LAN — for Uptime Kuma
+    networks:
+      - mail
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/health"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  gmail-data:
+  m365-data:
+
+networks:
+  mail:
+    driver: bridge

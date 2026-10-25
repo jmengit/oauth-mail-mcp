@@ -1,0 +1,70 @@
+name: upstream
+
+# Keeps the pinned himalaya / ortie versions from going stale: when either project cuts a
+# release, open a PR bumping versions.env. Merging that PR triggers build.yml.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pinned versions with latest upstream releases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          set -a; . ./versions.env; set +a
+
+          latest_himalaya=$(gh api repos/pimalaya/himalaya/releases/latest --jq .tag_name | sed 's/^v//')
+          latest_ortie=$(gh api repos/pimalaya/ortie/releases/latest --jq .tag_name | sed 's/^v//')
+
+          echo "himalaya: pinned ${HIMALAYA_VERSION}, latest ${latest_himalaya}"
+          echo "ortie: pinned ${ORTIE_VERSION}, latest ${latest_ortie}"
+
+          changed=false
+          if [ "${latest_himalaya}" != "${HIMALAYA_VERSION}" ]; then
+            sed -i "s/^HIMALAYA_VERSION=.*/HIMALAYA_VERSION=${latest_himalaya}/" versions.env
+            changed=true
+          fi
+          if [ "${latest_ortie}" != "${ORTIE_VERSION}" ]; then
+            sed -i "s/^ORTIE_VERSION=.*/ORTIE_VERSION=${latest_ortie}/" versions.env
+            changed=true
+          fi
+
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "himalaya=${latest_himalaya}" >> "$GITHUB_OUTPUT"
+          echo "ortie=${latest_ortie}" >> "$GITHUB_OUTPUT"
+
+      - name: Open a pull request
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="chore/upstream-$(date -u +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add versions.env
+          git commit -m "chore: bump himalaya to ${{ steps.check.outputs.himalaya }}, ortie to ${{ steps.check.outputs.ortie }}"
+          git push -u origin "$branch"
+          gh pr create \
+            --title "chore: bump himalaya to ${{ steps.check.outputs.himalaya }}, ortie to ${{ steps.check.outputs.ortie }}" \
+            --body "Automated upstream release check.
+
+          - himalaya: \`${{ steps.check.outputs.himalaya }}\`
+          - ortie: \`${{ steps.check.outputs.ortie }}\`
+
+          Merging rebuilds the image via build.yml." \
+            --base main --head "$branch"

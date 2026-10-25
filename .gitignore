@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+*.json
+!versions.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+data/
+tokens/
+attachments/
+*.log
+.DS_Store
