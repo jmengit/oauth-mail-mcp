@@ -45,11 +45,14 @@ RUN python3 -m venv /opt/venv \
 COPY server.py /app/server.py
 
 # Non-root, and /data owned by that user so a fresh named volume inherits the right owner.
-RUN useradd --uid 1000 --create-home --home-dir /home/mail --shell /usr/sbin/nologin mail \
- && mkdir -p /data && chown mail:mail /data && chmod 700 /data
+# Debian already ships a `mail` user, so use a project-specific name and pin uid/gid 1000.
+RUN groupadd --gid 1000 mailmcp \
+ && useradd --uid 1000 --gid 1000 --create-home --home-dir /home/mailmcp \
+      --shell /usr/sbin/nologin mailmcp \
+ && mkdir -p /data && chown mailmcp:mailmcp /data && chmod 700 /data
 
-USER mail
-ENV HOME=/home/mail \
+USER mailmcp
+ENV HOME=/home/mailmcp \
     MAIL_DATA_DIR=/data
 
 EXPOSE 8080 8081 8082
