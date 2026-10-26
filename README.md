@@ -71,14 +71,14 @@ The container can run its own OAuth flow, so reauthorising never needs the agent
 
 ```bash
 # start a grant: prints a Google URL, or a Microsoft device code
-docker exec -it oauth-mail-mcp-gmail python /app/server.py auth-start
+docker exec -it oauth-mail-mcp-gmail mail auth-start
 
 # finish it: pass the redirected URL (Gmail), or nothing for Microsoft (it waits for approval)
-docker exec -it oauth-mail-mcp-gmail python /app/server.py auth-resume '<redirect url>'
-docker exec -it oauth-mail-mcp-m365  python /app/server.py auth-resume
+docker exec -it oauth-mail-mcp-gmail mail auth-resume '<redirect url>'
+docker exec -it oauth-mail-mcp-m365  mail auth-resume
 
 # check state at any time
-docker exec -it oauth-mail-mcp-gmail python /app/server.py status
+docker exec -it oauth-mail-mcp-gmail mail status
 ```
 
 ## OAuth flows

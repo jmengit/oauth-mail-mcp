@@ -44,6 +44,11 @@ RUN python3 -m venv /opt/venv \
 
 COPY server.py /app/server.py
 
+# `python` is not on PATH in Debian, and the venv holds the deps: give the container a stable
+# command so `docker exec -it <container> mail auth-start` works without knowing either.
+RUN printf '#!/bin/sh\nexec /opt/venv/bin/python /app/server.py "$@"\n' > /usr/local/bin/mail \
+ && chmod 0755 /usr/local/bin/mail
+
 # Non-root, and /data owned by that user so a fresh named volume inherits the right owner.
 # Debian already ships a `mail` user, so use a project-specific name and pin uid/gid 1000.
 RUN groupadd --gid 1000 mailmcp \
