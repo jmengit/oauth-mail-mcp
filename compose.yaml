@@ -16,6 +16,7 @@ services:
       MAIL_ADDRESS: ${GMAIL_ADDRESS}
       MAIL_MCP_TOKEN: ${GMAIL_MCP_TOKEN}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      MAIL_READ_ONLY: "true"
       MAIL_ALLOW_SEND: "false"
       MAIL_HEALTH_CACHE_SECS: "60"
     volumes:
@@ -40,6 +41,7 @@ services:
       MAIL_ACCOUNT: m365
       MAIL_ADDRESS: ${M365_ADDRESS}
       MAIL_MCP_TOKEN: ${M365_MCP_TOKEN}
+      MAIL_READ_ONLY: "true"
       MAIL_ALLOW_SEND: "false"
       MAIL_HEALTH_CACHE_SECS: "60"
     volumes:

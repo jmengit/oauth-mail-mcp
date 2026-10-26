@@ -372,3 +372,22 @@ def test_json_or_error_falls_back_to_stdout(monkeypatch):
     data, err = server._json_or_error(["himalaya", "envelope", "search"])
     assert data is None
     assert "cannot parse" in err
+
+
+# --------------------------------------------------------------------------- read-only gate
+
+
+def test_write_tools_refuse_when_read_only(monkeypatch):
+    monkeypatch.setattr(server, "READ_ONLY", True)
+    for name, fn, args in (
+        ("mail_flags", server.mail_flags, {"ids": ["1"], "add": ["flagged"]}),
+        ("mail_draft", server.mail_draft, {"to": "a@b.c", "subject": "s", "body": "b"}),
+        ("mail_send", server.mail_send, {"to": "a@b.c", "subject": "s", "body": "b"}),
+    ):
+        result = fn(**args)
+        assert result["ok"] is False
+        assert "read-only" in result["error"]
+
+
+def test_attachment_guard_rejects_outside_paths():
+    assert server._allowed_path(server.ATTACHMENTS / "x" / "a.pdf") is True

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from email import policy
@@ -44,6 +45,9 @@ ADDRESS = os.environ.get("MAIL_ADDRESS", "").strip()
 DISPLAY_NAME = os.environ.get("MAIL_DISPLAY_NAME", "").strip()
 MCP_TOKEN = os.environ.get("MAIL_MCP_TOKEN", "").strip()
 ALLOW_SEND = os.environ.get("MAIL_ALLOW_SEND", "false").lower() == "true"
+# Read-only by default: a container that is never told otherwise must not be able to change
+# mailbox state. Writes (flags, drafts, sending) require MAIL_READ_ONLY=false as well.
+READ_ONLY = os.environ.get("MAIL_READ_ONLY", "true").lower() == "true"
 HEALTH_CACHE_SECS = int(os.environ.get("MAIL_HEALTH_CACHE_SECS", "60"))
 MAX_BODY_CHARS = int(os.environ.get("MAIL_MAX_BODY_CHARS", "20000"))
 MCP_PORT = int(os.environ.get("MAIL_MCP_PORT", "8080"))
@@ -120,6 +124,14 @@ _health_cache: dict[str, object] = {"ts": 0.0, "payload": None}
 _health_lock = threading.Lock()
 _pending_lock = threading.Lock()
 _poller: dict[str, object] = {"thread": None, "expires": 0.0}
+
+
+def _read_only_refusal(tool: str) -> dict:
+    return {
+        "ok": False,
+        "error": f"{tool} is disabled: this container is read-only",
+        "hint": "set MAIL_READ_ONLY=false (and MAIL_ALLOW_SEND=true to send) on the service",
+    }
 
 
 def log(message: str) -> None:
@@ -788,6 +800,8 @@ def mail_attachment(id: str, name: str = "", mailbox: str = "INBOX") -> dict:
 @mcp.tool()
 def mail_flags(ids: list[str], add: list[str] | None = None, remove: list[str] | None = None, mailbox: str = "INBOX") -> dict:
     """Add or remove flags on messages. Allowed flags: seen, flagged, answered, draft."""
+    if READ_ONLY:
+        return _read_only_refusal("mail_flags")
     if not ids:
         return {"ok": False, "error": "ids is required"}
     add = [f for f in (add or []) if f]
@@ -811,6 +825,8 @@ def mail_flags(ids: list[str], add: list[str] | None = None, remove: list[str] |
 @mcp.tool()
 def mail_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Save a draft (never sends). Use for anything the user should review first."""
+    if READ_ONLY:
+        return _read_only_refusal("mail_draft")
     args = [
         HIMALAYA,
         "message",
@@ -837,6 +853,8 @@ def mail_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
 @mcp.tool()
 def mail_send(to: str, subject: str, body: str, cc: str = "", attachments: list[str] | None = None) -> dict:
     """Send a message. Refused unless MAIL_ALLOW_SEND=true is set on the container."""
+    if READ_ONLY:
+        return _read_only_refusal("mail_send")
     if not ALLOW_SEND:
         return {
             "ok": False,
@@ -982,11 +1000,89 @@ class BearerGuard:
 
 
 # --------------------------------------------------------------------------------------
+# CLI subcommands, for authorising by hand inside the container:
+#   docker exec -it <container> python /app/server.py auth-start
+#   docker exec -it <container> python /app/server.py auth-resume '<redirect url or code>'
+#   docker exec -it <container> python /app/server.py status
+# --------------------------------------------------------------------------------------
+
+
+def cli_auth_start() -> int:
+    data, err = _json_or_error([ORTIE, "auth", "get", "-a", ACCOUNT, "--json"], timeout=60)
+    if err:
+        print(f"error: {err}")
+        return 1
+    if ACCOUNT == "m365":
+        save_pending({"device_code": data.get("device_code"), "created": time.time()})
+        print(f"Open: {data.get('verification_uri') or 'https://login.microsoft.com/device'}")
+        print(f"Code: {data.get('user_code')}")
+        print(f"Expires in: {int(data.get('expires_in') or 900)}s")
+        print("")
+        print("Then run:  python /app/server.py auth-resume        (waits for approval)")
+        return 0
+    save_pending(
+        {
+            "state": data.get("state"),
+            "verifier": data.get("pkce_code_verifier"),
+            "redirect": f"http://localhost:{PUBLIC_CALLBACK_PORT}",
+            "created": time.time(),
+        }
+    )
+    print(data.get("authorization_uri"))
+    print("")
+    print(f"Open it on a machine where http://localhost:{PUBLIC_CALLBACK_PORT} reaches this container.")
+    print("If the redirect fails, copy the address-bar URL and run:")
+    print("  python /app/server.py auth-resume '<url>'")
+    return 0
+
+
+def cli_auth_resume(value: str | None) -> int:
+    pending = load_pending()
+    if not value:
+        if ACCOUNT == "m365" and pending.get("device_code"):
+            print("Waiting for approval (Ctrl-C to stop)...")
+            ok, detail = complete_grant_device(pending["device_code"])
+            print("authorised" if ok else f"error: {detail}")
+            return 0 if ok else 1
+        print("error: pass the redirected URL (or the device code)")
+        return 1
+    if ACCOUNT == "m365" and not value.lower().startswith("http"):
+        ok, detail = complete_grant_device(value)
+    else:
+        redirect = value
+        if not value.lower().startswith("http"):
+            redirect = f"http://localhost:{PUBLIC_CALLBACK_PORT}/?code={value}"
+        ok, detail = complete_grant(redirect)
+    print("authorised" if ok else f"error: {detail}")
+    return 0 if ok else 1
+
+
+def run_cli(argv: list[str]) -> int:
+    if ACCOUNT not in PROVIDERS:
+        print(f"MAIL_ACCOUNT must be one of {sorted(PROVIDERS)}")
+        return 2
+    render_configs()
+    cmd = argv[0]
+    if cmd == "auth-start":
+        return cli_auth_start()
+    if cmd == "auth-resume":
+        return cli_auth_resume(argv[1] if len(argv) > 1 else None)
+    if cmd in ("status", "health"):
+        print(json.dumps(get_health(force=True), indent=2))
+        return 0
+    print(__doc__)
+    return 2
+
+
+# --------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        raise SystemExit(run_cli(argv))
     if ACCOUNT not in PROVIDERS:
         raise SystemExit(f"MAIL_ACCOUNT must be one of {sorted(PROVIDERS)}, got {ACCOUNT!r}")
     if not ADDRESS:

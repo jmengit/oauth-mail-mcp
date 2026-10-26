@@ -49,7 +49,8 @@ docker exec -it oauth-mail-mcp-gmail sh -lc 'ORTIE_CONFIG=/data/config/ortie.tom
 | `MAIL_ACCOUNT` | yes | `gmail` or `m365` — selects endpoints, grant and folder aliases |
 | `MAIL_ADDRESS` | yes | mailbox address, used as the SASL username and `From` |
 | `MAIL_MCP_TOKEN` | yes | bearer token the MCP client must present (`openssl rand -hex 32`) |
-| `MAIL_ALLOW_SEND` | no | `true` enables `mail_send`; default `false` |
+| `MAIL_READ_ONLY` | no | default `true`: flags, drafts and sending all refuse |
+| `MAIL_ALLOW_SEND` | no | `true` enables `mail_send` (still needs `MAIL_READ_ONLY=false`) |
 | `GOOGLE_CLIENT_SECRET` | gmail | Mozilla's public Thunderbird client secret |
 | `MAIL_HEALTH_CACHE_SECS` | no | health probe cache, default 60 |
 | `MAIL_MAX_BODY_CHARS` | no | body truncation for `mail_read`, default 20000 |
@@ -59,8 +60,26 @@ docker exec -it oauth-mail-mcp-gmail sh -lc 'ORTIE_CONFIG=/data/config/ortie.tom
 `mail_status`, `mail_mailboxes`, `mail_list`, `mail_search`, `mail_read`, `mail_attachment`,
 `mail_flags`, `mail_draft`, `mail_send`, `mail_authorize_start`, `mail_authorize_resume`.
 
-No delete, no move, no folder creation. `mail_send` refuses unless `MAIL_ALLOW_SEND=true`.
-Drafts are the intended write path: an injected mail body can at worst create a draft.
+No delete, no move, no folder creation. **The default is read-only**: with `MAIL_READ_ONLY=true`
+(absent any setting) `mail_flags`, `mail_draft` and `mail_send` all refuse, so an injected mail
+body can only cause reads. To write, set `MAIL_READ_ONLY=false`; to send, also
+`MAIL_ALLOW_SEND=true`. Reading never marks a message as seen (himalaya peeks).
+
+## Authorising by hand
+
+The container can run its own OAuth flow, so reauthorising never needs the agent or a host shell:
+
+```bash
+# start a grant: prints a Google URL, or a Microsoft device code
+docker exec -it oauth-mail-mcp-gmail python /app/server.py auth-start
+
+# finish it: pass the redirected URL (Gmail), or nothing for Microsoft (it waits for approval)
+docker exec -it oauth-mail-mcp-gmail python /app/server.py auth-resume '<redirect url>'
+docker exec -it oauth-mail-mcp-m365  python /app/server.py auth-resume
+
+# check state at any time
+docker exec -it oauth-mail-mcp-gmail python /app/server.py status
+```
 
 ## OAuth flows
 
