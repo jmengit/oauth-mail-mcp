@@ -321,3 +321,13 @@ def test_device_poll_silent_when_code_expires_unused(monkeypatch):
     monkeypatch.setattr(server, "invalidate_health", lambda: calls.append(1))
     server.device_poll("device-code-abc", 5, time.time() + 300)
     assert calls == []
+
+
+# --------------------------------------------------------------------------- envelope shape
+
+
+def test_envelopes_accepts_wrapped_object():
+    assert server._envelopes({"envelopes": [{"id": "1"}]}) == [{"id": "1"}]
+    assert server._envelopes([{"id": "1"}]) == [{"id": "1"}]
+    assert server._envelopes({"other": 1}) == []
+    assert server._envelopes(None) == []

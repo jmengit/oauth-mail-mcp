@@ -288,6 +288,20 @@ def _fmt_addresses(value) -> str:
     return ", ".join(p for p in parts if p)
 
 
+def _envelopes(data) -> list:
+    """himalaya wraps envelope pages in an object (`{"envelopes": [...]}`), while mailbox
+    listings are bare arrays; accept both shapes so a backend change cannot silently
+    return an empty inbox."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("envelopes", "items", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
 def _norm_envelope(raw: dict) -> dict:
     flags = raw.get("flags") or []
     if isinstance(flags, str):
@@ -671,7 +685,7 @@ def mail_list(mailbox: str = "INBOX", page: int = 1, page_size: int = 25, unread
     )
     if err:
         return {"ok": False, "error": err}
-    envelopes = [_norm_envelope(e) for e in (data if isinstance(data, list) else [])]
+    envelopes = [_norm_envelope(e) for e in _envelopes(data)]
     if unread_only:
         envelopes = [e for e in envelopes if e["unread"]]
     return {"ok": True, "mailbox": mailbox, "page": page, "envelopes": envelopes}
@@ -704,7 +718,7 @@ def mail_search(query: str, mailbox: str = "INBOX", page_size: int = 25) -> dict
         "ok": True,
         "mailbox": mailbox,
         "query": query,
-        "envelopes": [_norm_envelope(e) for e in (data if isinstance(data, list) else [])],
+        "envelopes": [_norm_envelope(e) for e in _envelopes(data)],
     }
 
 
