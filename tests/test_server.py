@@ -347,3 +347,28 @@ def test_norm_envelope_understands_himalaya_flag_objects():
 def test_flag_name_handles_plain_strings():
     assert server._flag_name("\\Seen") == "seen"
     assert server._flag_name({"raw": "\\Flagged", "iana": "flagged"}) == "flagged"
+
+
+def test_search_puts_query_last(monkeypatch):
+    """Options after a trailing var-arg query are parsed as part of the query."""
+    seen = {}
+
+    def fake_json(args, timeout=60):
+        seen["args"] = args
+        return {"envelopes": []}, None
+
+    monkeypatch.setattr(server, "_json_or_error", fake_json)
+    server.mail_search("from alice and after 2026-10-01", "Inbox", 10)
+    args = seen["args"]
+    assert args[-1] == "from alice and after 2026-10-01"
+    assert args.index("--json") < args.index("from alice and after 2026-10-01")
+    assert "-a" in args and "-m" in args
+
+
+def test_json_or_error_falls_back_to_stdout(monkeypatch):
+    monkeypatch.setattr(
+        server, "_run", lambda *a, **k: (1, "Error: cannot parse search emails query", "")
+    )
+    data, err = server._json_or_error(["himalaya", "envelope", "search"])
+    assert data is None
+    assert "cannot parse" in err

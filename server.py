@@ -254,7 +254,8 @@ def _run(args: list[str], timeout: int = 60, stdin: str | None = None, binary: b
 def _json_or_error(args: list[str], timeout: int = 60):
     rc, out, err = _run(args, timeout=timeout)
     if rc != 0:
-        return None, _error_text(rc, err)
+        # himalaya reports failures on stdout, not stderr, so fall back to it.
+        return None, _error_text(rc, err or out)
     try:
         return json.loads(out), None
     except json.JSONDecodeError:
@@ -708,12 +709,13 @@ def mail_search(query: str, mailbox: str = "INBOX", page_size: int = 25) -> dict
     'from accounts and after 2026-10-01', 'subject invoice', 'body statement'."""
     if not query or not query.strip():
         return {"ok": False, "error": "query is required"}
+    # The query is a trailing var-arg and would swallow any option placed after it,
+    # so every flag comes first and the query goes last.
     data, err = _json_or_error(
         [
             HIMALAYA,
             "envelope",
             "search",
-            query,
             "-a",
             ACCOUNT,
             "-m",
@@ -721,6 +723,7 @@ def mail_search(query: str, mailbox: str = "INBOX", page_size: int = 25) -> dict
             "-s",
             str(max(1, min(page_size, 100))),
             "--json",
+            query,
         ]
     )
     if err:
