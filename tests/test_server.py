@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -287,3 +288,36 @@ def test_send_disabled_by_default():
         pytest.skip("tool decorator does not expose the raw function")
     assert result["ok"] is False
     assert "disabled" in result["error"]
+
+
+# --------------------------------------------------------------------------- device poller
+
+
+def test_device_poll_uses_one_long_call(monkeypatch):
+    """ortie polls internally, so the wrapper must not chop the wait into short retries."""
+    seen = {}
+
+    def fake_run(args, timeout=60, stdin=None, binary=False):
+        seen["timeout"] = timeout
+        seen["args"] = args
+        return 0, "", ""
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    calls = []
+    monkeypatch.setattr(server, "invalidate_health", lambda: calls.append(1))
+    server.device_poll("device-code-abc", 5, time.time() + 300)
+
+    assert seen["args"][:3] == [server.ORTIE, "auth", "resume"]
+    assert seen["timeout"] >= 300
+    assert calls == [1]
+
+
+def test_device_poll_silent_when_code_expires_unused(monkeypatch):
+    def fake_run(args, timeout=60, stdin=None, binary=False):
+        return 124, "", "timeout after 330s: ortie auth resume"
+
+    monkeypatch.setattr(server, "_run", fake_run)
+    calls = []
+    monkeypatch.setattr(server, "invalidate_health", lambda: calls.append(1))
+    server.device_poll("device-code-abc", 5, time.time() + 300)
+    assert calls == []

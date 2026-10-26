@@ -122,6 +122,10 @@ _pending_lock = threading.Lock()
 _poller: dict[str, object] = {"thread": None, "expires": 0.0}
 
 
+def log(message: str) -> None:
+    print(f"oauth-mail-mcp: {message}", flush=True)
+
+
 # --------------------------------------------------------------------------------------
 # Config rendering
 # --------------------------------------------------------------------------------------
@@ -573,18 +577,23 @@ class CallbackHandler(BaseHTTPRequestHandler):
 
 
 def device_poll(device_code: str, interval: int, expires_at: float) -> None:
-    while time.time() < expires_at:
-        rc, _out, err = _run(
-            [ORTIE, "auth", "resume", device_code, "-a", ACCOUNT], timeout=max(60, interval + 30)
-        )
-        if rc == 0:
-            invalidate_health()
-            return
-        if re.search(r"authorization_pending|slow_down|not yet", err or "", re.IGNORECASE):
-            time.sleep(max(5, interval))
-            continue
+    """Wait for the tenant to approve a device code.
+
+    `ortie auth resume <device_code>` blocks and polls internally until the code is approved
+    or expires, so this issues one long call rather than a tight retry loop. A timeout here
+    means the code lapsed unused, which is not an error worth logging loudly.
+    """
+    remaining = max(60.0, expires_at - time.time())
+    rc, _out, err = _run(
+        [ORTIE, "auth", "resume", device_code, "-a", ACCOUNT], timeout=int(remaining) + 30
+    )
+    if rc == 0:
         invalidate_health()
         return
+    # 124 is our own timeout expiring: the tenant never approved.
+    if rc == 124:
+        return
+    log(f"device grant did not complete: {_error_text(rc, err)}")
 
 
 def start_callback_listener() -> ThreadingHTTPServer:
@@ -859,6 +868,7 @@ def mail_authorize_start() -> dict:
             "flow": "device_code",
             "url": data.get("verification_uri") or "https://login.microsoft.com/device",
             "code": data.get("user_code"),
+            "device_code": data.get("device_code"),
             "expires_in": int(expires),
             "instructions": "Open the URL on any device, enter the code, approve. No callback needed.",
         }
