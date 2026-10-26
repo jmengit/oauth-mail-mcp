@@ -331,3 +331,19 @@ def test_envelopes_accepts_wrapped_object():
     assert server._envelopes([{"id": "1"}]) == [{"id": "1"}]
     assert server._envelopes({"other": 1}) == []
     assert server._envelopes(None) == []
+
+
+def test_norm_envelope_understands_himalaya_flag_objects():
+    env = server._norm_envelope(
+        {
+            "id": "9",
+            "flags": [{"raw": "\\\\Seen", "iana": "seen"}, {"raw": "\\\\Flagged", "iana": "flagged"}],
+        }
+    )
+    assert env["flags"] == ["seen", "flagged"]
+    assert env["unread"] is False
+
+
+def test_flag_name_handles_plain_strings():
+    assert server._flag_name("\\Seen") == "seen"
+    assert server._flag_name({"raw": "\\Flagged", "iana": "flagged"}) == "flagged"

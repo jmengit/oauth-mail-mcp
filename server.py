@@ -302,18 +302,29 @@ def _envelopes(data) -> list:
     return []
 
 
+def _flag_name(flag) -> str:
+    """himalaya serialises a flag as `{"raw": "\\Seen", "iana": "seen"}`; older shapes are
+    bare strings. Normalise to the IANA name so callers can compare plainly."""
+    if isinstance(flag, dict):
+        name = flag.get("iana") or flag.get("raw") or ""
+    else:
+        name = str(flag)
+    return str(name).strip().lstrip("\\").lower()
+
+
 def _norm_envelope(raw: dict) -> dict:
     flags = raw.get("flags") or []
-    if isinstance(flags, str):
+    if isinstance(flags, (str, dict)):
         flags = [flags]
+    names = [n for n in (_flag_name(f) for f in flags) if n]
     return {
         "id": str(raw.get("id", "")),
         "subject": raw.get("subject") or "",
         "from": _fmt_addresses(raw.get("from")),
         "to": _fmt_addresses(raw.get("to")),
         "date": raw.get("date"),
-        "flags": [str(f) for f in flags],
-        "unread": "seen" not in [str(f).lower() for f in flags],
+        "flags": names,
+        "unread": "seen" not in names,
         "size": raw.get("size"),
         "has_attachment": raw.get("has-attachment", raw.get("has_attachment")),
     }
