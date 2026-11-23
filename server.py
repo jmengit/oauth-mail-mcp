@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,6 +65,24 @@ LOCK_FILE = DATA / "mail.lock"
 
 HIMALAYA = os.environ.get("HIMALAYA_BIN", "/usr/local/bin/himalaya")
 ORTIE = os.environ.get("ORTIE_BIN", "/usr/local/bin/ortie")
+
+
+def _ortie_args(*args: str) -> list[str]:
+    """Build an ortie command line that names its config file.
+
+    Ortie 3 stopped reading ORTIE_CONFIG, and this container never writes the default
+    $HOME/.config/ortie/config.toml, so every invocation — including the ones himalaya
+    runs to fetch an access token — must pass -c explicitly. Ortie 2 accepts the same
+    flag, which keeps one server.py usable with both pinned versions.
+    """
+    return [ORTIE, "-c", str(CONFIG / "ortie.toml"), *args]
+
+
+def _cmd_label(args: list[str]) -> str:
+    """Short command name for error text, leaving out the config path."""
+    body = args[3:] if len(args) > 3 and args[1] == "-c" else args[1:]
+    return " ".join([args[0], *body[:2]])
+
 
 # Public OAuth clients shipped by Mozilla in Thunderbird. Using them is the whole point:
 # no Google Cloud project, no Azure app registration, no admin consent.
@@ -116,7 +135,10 @@ PROVIDERS = {
 
 AUTH_ERROR_RE = re.compile(
     r"invalid_grant|invalid_client|unauthorized|authentication failed|authenticate failed|"
-    r"authenticationfailed|login failed|401|token has expired|revoked|interaction_required",
+    r"authenticationfailed|login failed|401|token has expired|revoked|interaction_required|"
+    # ortie prints these when the stored token cannot be read back as a token at all:
+    # a corrupt or half-written file is a grant problem, not a provider outage.
+    r"parse access token from command error|missing field .access_token.",
     re.IGNORECASE,
 )
 
@@ -202,7 +224,7 @@ def render_configs() -> None:
         f"imap.server = {_toml_str(provider['imap'])}",
         f"imap.sasl.xoauth2.username = {_toml_str(ADDRESS)}",
         "imap.sasl.xoauth2.token.command = ["
-        + ", ".join(_toml_str(x) for x in (ORTIE, "token", "show", "-a", ACCOUNT))
+        + ", ".join(_toml_str(x) for x in _ortie_args("token", "show", "-a", ACCOUNT))
         + "]",
         f"smtp.server = {_toml_str(provider['smtp'])}",
     ]
@@ -211,7 +233,7 @@ def render_configs() -> None:
     hima += [
         f"smtp.sasl.xoauth2.username = {_toml_str(ADDRESS)}",
         "smtp.sasl.xoauth2.token.command = ["
-        + ", ".join(_toml_str(x) for x in (ORTIE, "token", "show", "-a", ACCOUNT))
+        + ", ".join(_toml_str(x) for x in _ortie_args("token", "show", "-a", ACCOUNT))
         + "]",
     ]
     for role, mailbox in provider["aliases"].items():
@@ -226,7 +248,6 @@ def render_configs() -> None:
 def child_env() -> dict[str, str]:
     env = dict(os.environ)
     env["HIMALAYA_CONFIG"] = str(CONFIG / "himalaya.toml")
-    env["ORTIE_CONFIG"] = str(CONFIG / "ortie.toml")
     env.setdefault("HOME", str(DATA))
     env["TMPDIR"] = str(DATA / "tmp")
     (DATA / "tmp").mkdir(parents=True, exist_ok=True)
@@ -258,7 +279,7 @@ def _run(args: list[str], timeout: int = 60, stdin: str | None = None, binary: b
             err = proc.stderr.decode(errors="replace") if binary else (proc.stderr or "")
             return proc.returncode, out, err
         except subprocess.TimeoutExpired:
-            return 124, b"" if binary else "", f"timeout after {timeout}s: {' '.join(args[:3])}"
+            return 124, b"" if binary else "", f"timeout after {timeout}s: {_cmd_label(args)}"
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
@@ -266,18 +287,123 @@ def _run(args: list[str], timeout: int = 60, stdin: str | None = None, binary: b
 def _json_or_error(args: list[str], timeout: int = 60):
     rc, out, err = _run(args, timeout=timeout)
     if rc != 0:
-        # himalaya reports failures on stdout, not stderr, so fall back to it.
-        return None, _error_text(rc, err or out)
+        # Both himalaya and ortie report failures on stdout, not stderr.
+        text_out = out if isinstance(out, str) else ""
+        text_err = err if isinstance(err, str) else ""
+        return None, _failure_detail(rc, text_out, text_err)[1]
     try:
         return json.loads(out), None
     except json.JSONDecodeError:
-        return None, f"unparseable output from {' '.join(args[:2])}"
+        return None, f"unparseable output from {_cmd_label(args)}"
 
 
 def _error_text(rc: int, err: str) -> str:
     err = (err or "").strip()
     err = re.sub(r"\s+", " ", err)
     return err[:400] if err else f"command failed with exit code {rc}"
+
+
+def _error_object(*streams: str) -> tuple[str | None, str]:
+    """Read ortie's JSON failure object, which it writes to stdout.
+
+    Ortie 3 adds a stable `code`; Ortie 2 prints the same object without one. Matching
+    on the code keeps health classification working when upstream rewords a message.
+    """
+    for text in streams:
+        text = (text or "").strip()
+        if not text.startswith("{"):
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict) or not ("error" in data or "code" in data):
+            continue
+        code = data.get("code") if isinstance(data.get("code"), str) else None
+        message = str(data.get("error") or "").strip()
+        sources = data.get("sources")
+        if isinstance(sources, list) and sources:
+            first = str(sources[0]).strip().splitlines()[0]
+            message = f"{message}: {first}" if message else first
+        return code, message
+    return None, ""
+
+
+def _failure_detail(rc: int, out: str, err: str) -> tuple[str | None, str]:
+    code, message = _error_object(out, err)
+    if message:
+        detail = f"{code}: {message}" if code else message
+        return code, detail[:400]
+    return None, _error_text(rc, err or out)
+
+
+# Ortie 3 codes meaning the stored grant can no longer be used. Anything else is treated
+# as an upstream problem, so a provider outage is not reported as a dead token.
+REAUTH_CODES = {
+    "grant-invalid",
+    "permission-denied",
+    "token-expired",
+    "token-missing",
+    "state-mismatch",
+    "device-code-expired",
+    "client-invalid",
+    "client-unauthorized",
+    "scope-invalid",
+}
+
+CONFIG_ERROR_RE = re.compile(
+    r"no configuration found|no account has the name|no account is marked default|"
+    r"several accounts are marked default|configures no endpoint",
+    re.IGNORECASE,
+)
+
+
+def _classify_failure(rc: int, out: str, err: str) -> tuple[str, str]:
+    """Map a failed command to a /health state plus a short detail string."""
+    code, detail = _failure_detail(rc, out, err)
+    if code in REAUTH_CODES:
+        return "reauth-required", detail
+    if AUTH_ERROR_RE.search(out or "") or AUTH_ERROR_RE.search(err or ""):
+        return "reauth-required", detail
+    if CONFIG_ERROR_RE.search(detail):
+        # Keep the public state vocabulary stable; name the real cause in the detail.
+        return "upstream-error", f"configuration error: {detail}"[:400]
+    return "upstream-error", detail
+
+
+def _first(data: dict, *keys: str, default=None):
+    for key in keys:
+        value = data.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _grant_start_fields(data) -> dict:
+    """Normalise `auth get --json` across ortie 2 (snake_case) and 3 (camelCase)."""
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "url": _first(data, "authorizationUri", "authorization_uri", default=""),
+        "state": _first(data, "state", default=""),
+        "verifier": _first(data, "pkceCodeVerifier", "pkce_code_verifier", default=""),
+        "redirect": _first(data, "redirectUri", default=""),
+        "device_code": _first(data, "deviceCode", "device_code", default=""),
+        "user_code": _first(data, "userCode", "user_code", default=""),
+        "verification_uri": _first(data, "verificationUri", "verification_uri", default=""),
+        "expires_in": _first(data, "expiresIn", "expires_in", default=900),
+        "interval": _first(data, "interval", default=5),
+    }
+
+
+def _parse_instant(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------------------------------
@@ -459,8 +585,16 @@ def _state(status: str, detail: str = "") -> dict:
     return payload
 
 
+def _as_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return ""
+
+
 def _token_expiry() -> dict:
-    rc, out, err = _run([ORTIE, "token", "inspect", "-a", ACCOUNT, "--json"], timeout=30)
+    rc, out, err = _run(_ortie_args("token", "inspect", "-a", ACCOUNT, "--json"), timeout=30)
     if rc != 0:
         return {}
     try:
@@ -469,13 +603,30 @@ def _token_expiry() -> dict:
         return {}
     if not isinstance(data, dict):
         return {}
+
+    # Keep the payload /health and mail_status have always exposed. Ortie 2 reported the
+    # granted lifetime; Ortie 3 reports absolute instants, so derive the same lifetime
+    # from issuedAt/expiresAt rather than leaking a different shape.
     keep = {}
-    for key, value in data.items():
-        low = key.lower()
-        if isinstance(value, (str, int, float, bool)) and any(k in low for k in ("expire", "scope", "type")):
-            if "token" in low and "type" not in low:
-                continue
-            keep[key] = value
+    token_type = _first(data, "tokenType", "token_type")
+    if token_type:
+        keep["token_type"] = token_type
+    scope = data.get("scope")
+    if isinstance(scope, str) and scope:
+        keep["scope"] = scope
+
+    expires_in = _first(data, "expiresIn", "expires_in")
+    if expires_in is None:
+        issued = _parse_instant(data.get("issuedAt"))
+        expires = _parse_instant(data.get("expiresAt"))
+        if expires is not None:
+            start = issued or datetime.now(timezone.utc)
+            expires_in = (expires - start).total_seconds()
+    if expires_in is not None:
+        try:
+            keep["expires_in"] = int(round(float(expires_in)))
+        except (TypeError, ValueError):
+            pass
     return keep
 
 
@@ -484,19 +635,17 @@ def probe_health() -> dict:
     if not token_file.exists():
         return _state("unauthenticated", "no token granted yet")
 
-    rc, _out, err = _run([ORTIE, "token", "show", "-a", ACCOUNT], timeout=45)
+    rc, out, err = _run(_ortie_args("token", "show", "-a", ACCOUNT), timeout=45)
     if rc != 0:
-        if AUTH_ERROR_RE.search(err or ""):
-            return _state("reauth-required", _error_text(rc, err))
-        return _state("upstream-error", _error_text(rc, err))
+        status, detail = _classify_failure(rc, _as_text(out), _as_text(err))
+        return _state(status, detail)
 
     rc, out, err = _run(
         [HIMALAYA, "envelope", "list", "-a", ACCOUNT, "-s", "1", "--json"], timeout=45
     )
     if rc != 0:
-        if AUTH_ERROR_RE.search(err or ""):
-            return _state("reauth-required", _error_text(rc, err))
-        return _state("upstream-error", _error_text(rc, err))
+        status, detail = _classify_failure(rc, _as_text(out), _as_text(err))
+        return _state(status, detail)
 
     payload = _state("ok")
     payload["token"] = _token_expiry()
@@ -575,7 +724,7 @@ def load_pending() -> dict:
 
 def complete_grant(redirect_url: str) -> tuple[bool, str]:
     pending = load_pending()
-    args = [ORTIE, "auth", "resume", redirect_url, "-a", ACCOUNT]
+    args = _ortie_args("auth", "resume", redirect_url, "-a", ACCOUNT)
     if pending.get("state"):
         args += ["-s", pending["state"]]
     if pending.get("verifier"):
@@ -584,7 +733,7 @@ def complete_grant(redirect_url: str) -> tuple[bool, str]:
         args += ["-r", pending["redirect"]]
     rc, out, err = _run(args, timeout=90)
     if rc != 0:
-        return False, _error_text(rc, err)
+        return False, _failure_detail(rc, _as_text(out), _as_text(err))[1]
     save_pending(None)
     invalidate_health()
     return True, "authorised"
@@ -622,8 +771,8 @@ def device_poll(device_code: str, interval: int, expires_at: float) -> None:
     means the code lapsed unused, which is not an error worth logging loudly.
     """
     remaining = max(60.0, expires_at - time.time())
-    rc, _out, err = _run(
-        [ORTIE, "auth", "resume", device_code, "-a", ACCOUNT], timeout=int(remaining) + 30
+    rc, out, err = _run(
+        _ortie_args("auth", "resume", device_code, "-a", ACCOUNT), timeout=int(remaining) + 30
     )
     if rc == 0:
         invalidate_health()
@@ -631,7 +780,7 @@ def device_poll(device_code: str, interval: int, expires_at: float) -> None:
     # 124 is our own timeout expiring: the tenant never approved.
     if rc == 124:
         return
-    log(f"device grant did not complete: {_error_text(rc, err)}")
+    log(f"device grant did not complete: {_failure_detail(rc, _as_text(out), _as_text(err))[1]}")
 
 
 def start_callback_listener() -> ThreadingHTTPServer:
@@ -893,17 +1042,23 @@ def mail_authorize_start() -> dict:
     if ACCOUNT == "m365" and _poller.get("thread") and float(_poller.get("expires") or 0) > time.time():
         return {"ok": True, "flow": "device_code", "note": "a device code is already active; waiting for approval"}
 
-    data, err = _json_or_error([ORTIE, "auth", "get", "-a", ACCOUNT, "--json"], timeout=60)
+    data, err = _json_or_error(_ortie_args("auth", "get", "-a", ACCOUNT, "--json"), timeout=60)
     if err:
         return {"ok": False, "error": err}
+    fields = _grant_start_fields(data)
 
     if ACCOUNT == "m365":
-        expires = float(data.get("expires_in") or 900)
-        interval = int(data.get("interval") or 5)
+        if not fields["device_code"] or not fields["user_code"]:
+            return {
+                "ok": False,
+                "error": "ortie returned no device code; refusing to start a poller",
+            }
+        expires = float(fields["expires_in"] or 900)
+        interval = int(fields["interval"] or 5)
         _poller["expires"] = time.time() + expires
         thread = threading.Thread(
             target=device_poll,
-            args=(data.get("device_code", ""), interval, time.time() + expires),
+            args=(fields["device_code"], interval, time.time() + expires),
             name="device-poll",
             daemon=True,
         )
@@ -912,25 +1067,28 @@ def mail_authorize_start() -> dict:
         return {
             "ok": True,
             "flow": "device_code",
-            "url": data.get("verification_uri") or "https://login.microsoft.com/device",
-            "code": data.get("user_code"),
-            "device_code": data.get("device_code"),
+            "url": fields["verification_uri"] or "https://login.microsoft.com/device",
+            "code": fields["user_code"],
+            "device_code": fields["device_code"],
             "expires_in": int(expires),
             "instructions": "Open the URL on any device, enter the code, approve. No callback needed.",
         }
 
+    if not fields["url"] or not fields["state"]:
+        return {"ok": False, "error": "ortie returned an incomplete authorization request"}
+
     save_pending(
         {
-            "state": data.get("state"),
-            "verifier": data.get("pkce_code_verifier"),
-            "redirect": f"http://localhost:{PUBLIC_CALLBACK_PORT}",
+            "state": fields["state"],
+            "verifier": fields["verifier"],
+            "redirect": fields["redirect"] or f"http://localhost:{PUBLIC_CALLBACK_PORT}",
             "created": time.time(),
         }
     )
     return {
         "ok": True,
         "flow": "authorization_code",
-        "url": data.get("authorization_uri"),
+        "url": fields["url"],
         "callback": f"http://localhost:{PUBLIC_CALLBACK_PORT}/",
         "instructions": (
             "Open the URL, approve. The redirect must load on the same machine as the browser: "
@@ -960,9 +1118,9 @@ def mail_authorize_resume(url_or_code: str) -> dict:
 
 
 def complete_grant_device(device_code: str) -> tuple[bool, str]:
-    rc, _out, err = _run([ORTIE, "auth", "resume", device_code, "-a", ACCOUNT], timeout=120)
+    rc, out, err = _run(_ortie_args("auth", "resume", device_code, "-a", ACCOUNT), timeout=120)
     if rc != 0:
-        return False, _error_text(rc, err)
+        return False, _failure_detail(rc, _as_text(out), _as_text(err))[1]
     invalidate_health()
     return True, "authorised"
 
@@ -1008,27 +1166,34 @@ class BearerGuard:
 
 
 def cli_auth_start() -> int:
-    data, err = _json_or_error([ORTIE, "auth", "get", "-a", ACCOUNT, "--json"], timeout=60)
+    data, err = _json_or_error(_ortie_args("auth", "get", "-a", ACCOUNT, "--json"), timeout=60)
     if err:
         print(f"error: {err}")
         return 1
+    fields = _grant_start_fields(data)
     if ACCOUNT == "m365":
-        save_pending({"device_code": data.get("device_code"), "created": time.time()})
-        print(f"Open: {data.get('verification_uri') or 'https://login.microsoft.com/device'}")
-        print(f"Code: {data.get('user_code')}")
-        print(f"Expires in: {int(data.get('expires_in') or 900)}s")
+        if not fields["device_code"] or not fields["user_code"]:
+            print("error: ortie returned no device code")
+            return 1
+        save_pending({"device_code": fields["device_code"], "created": time.time()})
+        print(f"Open: {fields['verification_uri'] or 'https://login.microsoft.com/device'}")
+        print(f"Code: {fields['user_code']}")
+        print(f"Expires in: {int(fields['expires_in'] or 900)}s")
         print("")
         print("Then run:  python /app/server.py auth-resume        (waits for approval)")
         return 0
+    if not fields["url"] or not fields["state"]:
+        print("error: ortie returned an incomplete authorization request")
+        return 1
     save_pending(
         {
-            "state": data.get("state"),
-            "verifier": data.get("pkce_code_verifier"),
-            "redirect": f"http://localhost:{PUBLIC_CALLBACK_PORT}",
+            "state": fields["state"],
+            "verifier": fields["verifier"],
+            "redirect": fields["redirect"] or f"http://localhost:{PUBLIC_CALLBACK_PORT}",
             "created": time.time(),
         }
     )
-    print(data.get("authorization_uri"))
+    print(fields["url"])
     print("")
     print(f"Open it on a machine where http://localhost:{PUBLIC_CALLBACK_PORT} reaches this container.")
     print("If the redirect fails, copy the address-bar URL and run:")

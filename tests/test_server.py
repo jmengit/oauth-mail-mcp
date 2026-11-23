@@ -181,7 +181,7 @@ def test_health_upstream_error_when_imap_unreachable(tmp_path, monkeypatch):
     _set_token(tmp_path, monkeypatch)
 
     def fake_run(args, timeout=60, stdin=None, binary=False):
-        if args[1] == "token":
+        if args[0] == server.ORTIE:
             return 0, "access-token", ""
         return 1, "", "connection refused"
 
@@ -193,7 +193,7 @@ def test_health_ok_when_token_and_imap_answer(tmp_path, monkeypatch):
     _set_token(tmp_path, monkeypatch)
 
     def fake_run(args, timeout=60, stdin=None, binary=False):
-        if args[1] == "token":
+        if args[0] == server.ORTIE:
             return 0, "access-token", ""
         return 0, "[]", ""
 
@@ -307,7 +307,8 @@ def test_device_poll_uses_one_long_call(monkeypatch):
     monkeypatch.setattr(server, "invalidate_health", lambda: calls.append(1))
     server.device_poll("device-code-abc", 5, time.time() + 300)
 
-    assert seen["args"][:3] == [server.ORTIE, "auth", "resume"]
+    assert seen["args"][:2] == [server.ORTIE, "-c"]
+    assert seen["args"][3:6] == ["auth", "resume", "device-code-abc"]
     assert seen["timeout"] >= 300
     assert calls == [1]
 

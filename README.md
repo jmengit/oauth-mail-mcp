@@ -39,8 +39,10 @@ First run reports `unauthenticated` — no token exists yet. Authorise through a
 by calling `mail_authorize_start`, or run ortie inside the container:
 
 ```bash
-docker exec -it oauth-mail-mcp-gmail sh -lc 'ORTIE_CONFIG=/data/config/ortie.toml ortie auth get -a gmail'
+docker exec -it oauth-mail-mcp-gmail sh -lc 'ortie -c /data/config/ortie.toml auth get -a gmail'
 ```
+
+Ortie 3 no longer reads `ORTIE_CONFIG`, so the config path is always passed with `-c`.
 
 ## Environment
 
@@ -125,8 +127,14 @@ Kuma: HTTP keyword monitor on `http://<host>:18080/health`, keyword `"status":"o
 
 GitHub Actions builds multi-arch images to `ghcr.io/jmengit/oauth-mail-mcp`, tagged
 `latest`, `sha-<short>`, and `YYYY.MM.DD-<short>`. Pin the dated tag in production so
-rollback is a tag change. `upstream.yml` checks daily for new himalaya/ortie releases and
-opens a PR bumping `versions.env`.
+rollback is a tag change.
+
+`versions.env` is the single source of truth for the bundled himalaya and ortie
+releases. `upstream.yml` checks daily: a patch or minor release opens a PR bumping
+`versions.env`, while a major release opens an issue instead, because ortie majors have
+changed config discovery and every `--json` key. `tests/test_live_contract.py` runs
+against both the pinned release and the previous one, so a bump cannot land without the
+config and JSON contracts still holding.
 
 ## Licence
 

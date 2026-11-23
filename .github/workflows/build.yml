@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -26,9 +28,77 @@ jobs:
         run: pip install -r requirements.txt pytest
       - name: Unit tests
         run: python -m pytest tests -q
+      - name: Ortie binary contract tests
+        run: |
+          set -euo pipefail
+          set -a; . ./versions.env; set +a
+          # 2.3.0 is the rollback anchor: one server.py must work with both binaries.
+          for version in 2.3.0 "$ORTIE_VERSION"; do
+            dir="/tmp/ortie-$version"
+            mkdir -p "$dir"
+            curl -fsSL -o "$dir/ortie.tgz" \
+              "https://github.com/pimalaya/ortie/releases/download/v$version/ortie.x86_64-linux.tgz"
+            tar -xzf "$dir/ortie.tgz" -C "$dir"
+            ORTIE_CONTRACT_BIN="$dir/ortie" ORTIE_CONTRACT_VERSION="$version" \
+              python -m pytest tests/test_live_contract.py -q
+          done
+
+  smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the container
+        run: |
+          set -euo pipefail
+          set -a; . ./versions.env; set +a
+          docker build \
+            --build-arg HIMALAYA_VERSION="$HIMALAYA_VERSION" \
+            --build-arg ORTIE_VERSION="$ORTIE_VERSION" \
+            -t oauth-mail-mcp:smoke .
+          docker run -d --name smoke \
+            -e MAIL_ACCOUNT=gmail \
+            -e MAIL_ADDRESS=smoke@example.com \
+            -e MAIL_MCP_TOKEN=smoke-token \
+            -p 18081:8081 oauth-mail-mcp:smoke
+
+          for _ in $(seq 1 30); do
+            if curl -s -o /tmp/health.json http://127.0.0.1:18081/health && [ -s /tmp/health.json ]; then
+              break
+            fi
+            sleep 2
+          done
+          cat /tmp/health.json
+
+          python3 - <<'PY'
+          import json
+
+          payload = json.load(open("/tmp/health.json"))
+          assert payload["status"] == "unauthenticated", payload
+          assert payload["account"] == "gmail", payload
+          PY
+
+      - name: Assert the bundled ortie and its config path
+        run: |
+          set -euo pipefail
+          set -a; . ./versions.env; set +a
+          docker exec smoke ortie --version | tee /tmp/ortie-version.txt
+          grep -q "ortie v$ORTIE_VERSION" /tmp/ortie-version.txt
+          # Ortie 3 ignores ORTIE_CONFIG, so -c must find a readable file.
+          docker exec smoke sh -lc 'test -r /data/config/ortie.toml'
+
+      - name: Container logs
+        if: always()
+        run: docker logs smoke || true
+
+      - name: Remove the container
+        if: always()
+        run: docker rm -f smoke || true
 
   build:
     needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,7 +1,14 @@
 name: upstream
 
-# Keeps the pinned himalaya / ortie versions from going stale: when either project cuts a
-# release, open a PR bumping versions.env. Merging that PR triggers build.yml.
+# Keeps the pinned himalaya / ortie releases current without letting a major bump merge
+# itself: ortie 3 stopped reading ORTIE_CONFIG and renamed every --json key, so a
+# version-only bump builds fine and then fails at runtime. Patch and minor releases open
+# a pull request; a major release opens an issue that requires a migration.
+#
+# Declaring pull-requests: write is not enough on its own: the repository must also allow
+# "GitHub Actions to create and approve pull requests" (Settings -> Actions -> General).
+# While that switch is off this workflow records the bump as an issue instead of failing
+# every morning.
 
 on:
   schedule:
@@ -11,6 +18,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   check:
@@ -20,51 +31,64 @@ jobs:
 
       - name: Compare pinned versions with latest upstream releases
         id: check
+        run: python3 .github/scripts/upstream_plan.py
+
+      - name: Bump patch and minor releases
+        if: steps.check.outputs.branch != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+          BUMP_JSON: ${{ steps.check.outputs.bump }}
         run: |
           set -euo pipefail
-          set -a; . ./versions.env; set +a
-
-          latest_himalaya=$(gh api repos/pimalaya/himalaya/releases/latest --jq .tag_name | sed 's/^v//')
-          latest_ortie=$(gh api repos/pimalaya/ortie/releases/latest --jq .tag_name | sed 's/^v//')
-
-          echo "himalaya: pinned ${HIMALAYA_VERSION}, latest ${latest_himalaya}"
-          echo "ortie: pinned ${ORTIE_VERSION}, latest ${latest_ortie}"
-
-          changed=false
-          if [ "${latest_himalaya}" != "${HIMALAYA_VERSION}" ]; then
-            sed -i "s/^HIMALAYA_VERSION=.*/HIMALAYA_VERSION=${latest_himalaya}/" versions.env
-            changed=true
-          fi
-          if [ "${latest_ortie}" != "${ORTIE_VERSION}" ]; then
-            sed -i "s/^ORTIE_VERSION=.*/ORTIE_VERSION=${latest_ortie}/" versions.env
-            changed=true
-          fi
-
-          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
-          echo "himalaya=${latest_himalaya}" >> "$GITHUB_OUTPUT"
-          echo "ortie=${latest_ortie}" >> "$GITHUB_OUTPUT"
-
-      - name: Open a pull request
-        if: steps.check.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          branch="chore/upstream-$(date -u +%Y%m%d)"
+          python3 .github/scripts/upstream_plan.py --apply
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          git add versions.env
-          git commit -m "chore: bump himalaya to ${{ steps.check.outputs.himalaya }}, ortie to ${{ steps.check.outputs.ortie }}"
-          git push -u origin "$branch"
-          gh pr create \
-            --title "chore: bump himalaya to ${{ steps.check.outputs.himalaya }}, ortie to ${{ steps.check.outputs.ortie }}" \
-            --body "Automated upstream release check.
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          if git diff --quiet -- versions.env; then
+            echo "versions.env already matches the latest patch/minor release"
+            exit 0
+          fi
+          git commit -am "chore: bump pinned upstream releases"
+          git push --force -u origin "$BRANCH"
 
-          - himalaya: \`${{ steps.check.outputs.himalaya }}\`
-          - ortie: \`${{ steps.check.outputs.ortie }}\`
+          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            echo "pull request #$number already open for $BRANCH"
+            exit 0
+          fi
 
-          Merging rebuilds the image via build.yml." \
-            --base main --head "$branch"
+          cat > /tmp/pr-body.md <<BODY
+          Automated bump of the pinned upstream releases.
+
+          \`\`\`
+          $(cat versions.env)
+          \`\`\`
+
+          The binary contract tests run against both the previous and the new release.
+          BODY
+
+          if ! gh pr create --base main --head "$BRANCH" \
+              --title "chore: bump pinned upstream releases" \
+              --body-file /tmp/pr-body.md; then
+            echo "::warning::Actions cannot open pull requests here; recording an issue instead."
+            gh issue create \
+              --title "chore: upstream bump needs a pull request ($BRANCH)" \
+              --body "$(printf 'The workflow pushed `%s` but could not open a pull request.\n\nOpen it at https://github.com/%s/pull/new/%s\n\nAllow Actions to create pull requests under Settings -> Actions -> General to automate this.\n\n```\n%s\n```\n' "$BRANCH" "$GITHUB_REPOSITORY" "$BRANCH" "$(cat versions.env)")" || true
+          fi
+
+      - name: Record major releases as migration issues
+        if: steps.check.outputs.major != '[]'
+        env:
+          MAJOR: ${{ steps.check.outputs.major }}
+        run: |
+          set -euo pipefail
+          echo "$MAJOR" | jq -r '.[] | "\(.dep) \(.pinned) \(.latest)"' | while read -r dep pinned latest; do
+            title="chore: migrate ${dep} v${latest} (major release)"
+            existing=$(gh issue list --state open --limit 100 --json number,title \
+              --jq ".[] | select(.title == \"$title\") | .number")
+            if [ -n "$existing" ]; then
+              echo "issue #$existing already tracks $dep v$latest"
+              continue
+            fi
+            gh issue create --title "$title" --body "$(printf 'Upstream cut a major release.\n\n| | |\n|---|---|\n| pinned | `%s` |\n| latest | `%s` |\n\nA version bump alone is unsafe: `versions.env` is deliberately unchanged until the code migrates. Read the migration guide, ship the code change, then bump the pin in the same pull request.\n\n- Release: https://github.com/pimalaya/%s/releases/tag/v%s\n- Migration guide: https://github.com/pimalaya/%s/blob/v%s/MIGRATION.md\n' "$pinned" "$latest" "$dep" "$latest" "$dep" "$latest")"
+          done
